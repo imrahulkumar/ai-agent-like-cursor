@@ -1,0 +1,17 @@
+{
+  "name": "ai-agent-like-cursor",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@google/genai": "^2.32.0",
+    "readline-sync": "^1.4.10"
+  }
+}
