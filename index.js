@@ -1,4 +1,5 @@
 import { GoogleGenAI } from "@google/genai";
+import Groq from "groq-sdk";
 import { exec } from "child_process";
 import readlineSync from "readline-sync";
 
@@ -9,19 +10,62 @@ try {
   // No .env file — fall back to exported environment variables
 }
 
-// 1. Initialize Gemini Client
-// Get a key from https://aistudio.google.com/apikey and put it in .env:
-//   GEMINI_API_KEY=your-key-here
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+// 1. Pick an LLM provider
+// Put one or both keys in .env:
+//   GROQ_API_KEY=...    (https://console.groq.com/keys)
+//   GEMINI_API_KEY=...  (https://aistudio.google.com/apikey)
+// Set LLM_PROVIDER=groq or LLM_PROVIDER=gemini to choose explicitly;
+// otherwise Groq is used when its key is present.
+const { GROQ_API_KEY, GEMINI_API_KEY } = process.env;
+const PROVIDER = (process.env.LLM_PROVIDER || (GROQ_API_KEY ? "groq" : "gemini")).toLowerCase();
 
-if (!GEMINI_API_KEY) {
-  console.error("❌ Missing GEMINI_API_KEY environment variable.");
-  console.error('   Add GEMINI_API_KEY=your-key-here to .env (or export it)');
+const MODELS = {
+  groq: process.env.GROQ_MODEL || "openai/gpt-oss-120b",
+  gemini: process.env.GEMINI_MODEL || "gemini-3.8-flash",
+};
+const MODEL = MODELS[PROVIDER];
+
+if (!MODEL) {
+  console.error(`❌ Unknown LLM_PROVIDER "${PROVIDER}". Use "groq" or "gemini".`);
   process.exit(1);
 }
 
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+const apiKey = PROVIDER === "groq" ? GROQ_API_KEY : GEMINI_API_KEY;
+if (!apiKey) {
+  const keyName = PROVIDER === "groq" ? "GROQ_API_KEY" : "GEMINI_API_KEY";
+  console.error(`❌ Missing ${keyName} environment variable.`);
+  console.error(`   Add ${keyName}=your-key-here to .env (or export it)`);
+  process.exit(1);
+}
+
+const client = PROVIDER === "groq" ? new Groq({ apiKey }) : new GoogleGenAI({ apiKey });
+
+// Send the conversation to the selected provider and return the reply text.
+// `messages` uses OpenAI-style roles: "user" and "assistant".
+async function chat(messages) {
+  if (PROVIDER === "groq") {
+    const completion = await client.chat.completions.create({
+      model: MODEL,
+      messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
+      response_format: { type: "json_object" },
+    });
+    return completion.choices[0].message.content;
+  }
+
+  // Gemini uses "user" / "model" roles; the system prompt goes in config.systemInstruction
+  const response = await client.models.generateContent({
+    model: MODEL,
+    contents: messages.map((m) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content }],
+    })),
+    config: {
+      systemInstruction: SYSTEM_PROMPT,
+      responseMimeType: "application/json",
+    },
+  });
+  return response.text;
+}
 
 // 2. Define Custom Tool for Command Execution
 // Failures are returned as text (not thrown) so the agent can see the error and recover.
@@ -69,26 +113,17 @@ Output Format Example:
 `;
 
 async function runAgent() {
-  // Gemini uses "user" / "model" roles; the system prompt goes in config.systemInstruction
-  const contents = [];
+  console.log(`⚙️  Using ${PROVIDER} (${MODEL})`);
+  const messages = [];
 
   // Prompt the user for what to build directly from the terminal
   const userQuery = readlineSync.question("What would you like me to build? ");
-  contents.push({ role: "user", parts: [{ text: userQuery }] });
+  messages.push({ role: "user", content: userQuery });
 
   while (true) {
     try {
-      const response = await ai.models.generateContent({
-        model: MODEL,
-        contents: contents,
-        config: {
-          systemInstruction: SYSTEM_PROMPT,
-          responseMimeType: "application/json",
-        },
-      });
-
-      const responseText = response.text;
-      contents.push({ role: "model", parts: [{ text: responseText }] });
+      const responseText = await chat(messages);
+      messages.push({ role: "assistant", content: responseText });
 
       let parsedResponse = JSON.parse(responseText);
       // Occasionally the model wraps a single step in an array
@@ -97,7 +132,7 @@ async function runAgent() {
       // Handle 'think' step
       if (parsedResponse.step === "think") {
         console.log(`🧠 [THINK]: ${parsedResponse.content}`);
-        contents.push({ role: "user", parts: [{ text: "Continue with the next step." }] });
+        messages.push({ role: "user", content: "Continue with the next step." });
         continue;
       }
 
@@ -121,9 +156,9 @@ async function runAgent() {
         console.log(`👁️ [OBSERVATION]:\n${observation}`);
 
         // Feed observation back into conversation history
-        contents.push({
+        messages.push({
           role: "user",
-          parts: [{ text: JSON.stringify({ step: "observe", content: observation }) }],
+          content: JSON.stringify({ step: "observe", content: observation }),
         });
 
         continue;
@@ -131,7 +166,13 @@ async function runAgent() {
 
       throw new Error(`Unknown step: ${responseText}`);
     } catch (error) {
-      console.error("❌ Error:", error);
+      if (error?.status === 429) {
+        console.error(`❌ ${PROVIDER} rate limit / quota exceeded for model "${MODEL}".`);
+        console.error("   Wait for it to reset, or switch provider/model in .env:");
+        console.error("   LLM_PROVIDER=groq|gemini, GROQ_MODEL=<name>, GEMINI_MODEL=<name>");
+      } else {
+        console.error("❌ Error:", error);
+      }
       break;
     }
   }
